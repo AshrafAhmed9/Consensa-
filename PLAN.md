@@ -1,6 +1,6 @@
 # Consensa — A Distributed SQL Database, Built From Scratch
 
-> A CockroachDB-class distributed SQL database in Go: LSM storage, Raft consensus,
+> A CockroachDB-class distributed SQL database in Python: LSM storage, Raft consensus,
 > multi-Raft range sharding, MVCC transactions with 2PC, a SQL layer speaking the
 > Postgres wire protocol — and a deterministic simulation harness that **proves**
 > it correct under partitions, crashes, and clock skew.
@@ -67,7 +67,7 @@ The target system at the end of Part I:
 flowchart TD
     psql["psql / any Postgres client"] -->|pgwire simple protocol| SQL
 
-    subgraph node ["Consensa Node (one binary, N of these)"]
+    subgraph node ["Consensa Node (one process, N of these)"]
         SQL["SQL Layer<br/>lexer → parser → planner → executor"]
         TXN["Transaction Layer<br/>HLC · MVCC · write intents · 2PC coordinator"]
         DIST["Distribution Layer<br/>range descriptors · meta ranges · routing"]
@@ -105,15 +105,32 @@ failure modes of ambitious side projects: quality rot and scope creep.
 Every component that touches the network, the clock, or the disk is written
 against an interface:
 
-```go
-type Transport interface { Send(to NodeID, msg Message); Recv() <-chan Message }
-type Clock     interface { Now() HLC; NewTimer(d time.Duration) Timer }
-type Storage   interface { /* WAL + SSTable operations */ }
+```python
+class Transport(Protocol):
+    async def send(self, to: NodeID, msg: Message) -> None: ...
+    async def recv(self) -> Message: ...
+
+class Clock(Protocol):
+    def now(self) -> HLC: ...
+    def new_timer(self, delay: float) -> Timer: ...
+
+class Storage(Protocol):
+    ...  # WAL + SSTable operations
 ```
 
-Production wires these to real TCP, the wall clock, and disk. Tests wire them to
-an **in-memory simulated network** whose message drops, delays, duplications,
-and reorderings — and whose clock skew — are driven by a **seeded PRNG**.
+Production wires these to real TCP (asyncio streams), the wall clock, and disk.
+Tests wire them to an **in-memory simulated network** whose message drops,
+delays, duplications, and reorderings — and whose clock skew — are driven by a
+**seeded PRNG**.
+
+**Concurrency model:** each node is a single asyncio event loop; a demo cluster
+is N processes. In tests, *all* simulated nodes run inside one loop that the
+simulator steps deterministically — the seeded scheduler decides every
+interleaving, which is exactly what deterministic simulation requires. This
+also makes Python's GIL a non-issue for correctness: there is no shared-memory
+parallelism anywhere in the design, so the data-race bug class doesn't exist
+here — concurrency bugs are *interleaving* bugs, and the sim explores those by
+the thousands.
 
 Consequences, and why this is the single highest-leverage decision in the plan:
 
@@ -130,10 +147,11 @@ Phase 0 because it cannot be retrofitted.
 
 | Dependency | Purpose | Why not stdlib |
 |---|---|---|
-| `anishathalye/porcupine` | linearizability checking | implementing WGL from scratch is a research project, not a database |
-| `prometheus/client_golang` | metrics | the ecosystem standard; hand-rolling it teaches nothing |
-| `pgregory.net/rapid` | property-based testing | stdlib `testing/quick` is frozen and weaker |
-| `golangci-lint` (dev only) | lint | table stakes |
+| `porcupine` (Go binary, invoked as a subprocess on JSON-exported histories) | linearizability checking | implementing WGL from scratch is a research project, not a database; there is no mature Python equivalent |
+| `prometheus_client` | metrics | the ecosystem standard; hand-rolling it teaches nothing |
+| `hypothesis` | property-based testing | best-in-class PBT anywhere; stdlib has nothing |
+| `numpy` (Phase 14 only) | vectorized execution batches | columnar speed in pure Python is physically impossible; NumPy *is* the columnar-batch lesson |
+| `ruff` + `mypy --strict` (dev only) | lint + static types | table stakes |
 
 **Everything else is stdlib or hand-built** — the RPC framing, the skiplist, the
 SQL parser, the HLC, the Raft implementation, the pgwire encoding. Building
@@ -158,8 +176,11 @@ key first.)
 
 ### 5. Process discipline
 
-- **CI on every push**: `go vet`, `golangci-lint`, `go test -race ./...`.
-  Nightly job: torture harness across N fresh seeds.
+- **CI on every push**: `ruff check`, `mypy --strict`, `pytest`.
+  Nightly job: torture harness across N fresh seeds. (There is no race
+  detector to run — see the concurrency model in §1: single-loop asyncio has
+  no data races, and the interleaving bugs that replace them are exactly what
+  the seeded simulator hunts.)
 - **One branch per phase**, merged via PR with a self-review pass against a
   checklist (naming, error handling, comment quality, test coverage of the
   failure paths — not just happy paths).
@@ -177,11 +198,10 @@ key first.)
 
 ```
 consensa/
-├── cmd/
-│   ├── consensa/          # the node binary (server)
-│   ├── consensa-cli/      # admin CLI (range inspection, membership ops)
-│   └── torture/           # chaos + verification harness
-├── internal/
+├── consensa/              # the Python package
+│   ├── server.py          # node entry point (`consensa` console script)
+│   ├── admin.py           # admin CLI (`consensa-cli`: range inspection, membership ops)
+│   ├── torture/           # chaos + verification harness (`torture` console script)
 │   ├── storage/           # Phase 1: WAL, memtable, SSTable, compaction
 │   ├── raft/              # Phase 2: consensus, elections, snapshots, joint consensus
 │   ├── kv/                # Phase 3: ranges, multi-raft, routing, split/merge
@@ -190,10 +210,12 @@ consensa/
 │   ├── pgwire/            # Phase 5: Postgres wire protocol (simple query mode)
 │   ├── sim/               # Phase 0: simulated transport, clock, fault injection
 │   └── metrics/           # Prometheus registration helpers
+├── tests/                 # mirrors the package layout
 ├── docs/
 │   ├── adr/               # architecture decision records
 │   └── correctness.md     # Phase 6: the "how do you know it works" document
 ├── deploy/                # docker-compose 3-node cluster, Grafana + Prometheus
+├── pyproject.toml         # deps, console scripts, ruff + mypy config
 ├── Makefile
 └── PLAN.md                # this file
 ```
@@ -215,15 +237,18 @@ Retrofitting CI, lint, or the simulator onto a grown codebase never happens.
 
 **Build:**
 
-- Go module, repo layout above, `Makefile` (`build`, `test`, `lint`, `torture`).
-- GitHub Actions: vet + lint + `-race` tests on push; nightly torture job
+- Python project (`pyproject.toml`, managed with `uv`), repo layout above,
+  `Makefile` (`test`, `lint`, `typecheck`, `torture`).
+- GitHub Actions: ruff + mypy + pytest on push; nightly torture job
   (empty for now — the hook exists from day one).
-- `internal/sim`: the `Transport`, `Clock` interfaces and their simulated
+- `consensa/sim`: the `Transport`, `Clock` protocols and their simulated
   implementations — seeded PRNG message scheduler supporting drop, delay,
-  duplication, reorder; a fake clock that only advances when the test says so.
-- ADR-001 (Go, and why the Python LSM gets ported rather than wrapped),
-  ADR-002 (deterministic simulation architecture), ADR-003 (dependency
-  allowlist).
+  duplication, reorder; a fake clock that only advances when the test says so;
+  a deterministic event-loop driver that owns all coroutine scheduling in tests.
+- ADR-001 (Python: the tradeoffs vs Go/Rust — GIL, raw throughput, no race
+  detector — and why each is acceptable or irrelevant given this project's
+  correctness-first goals), ADR-002 (deterministic simulation architecture),
+  ADR-003 (dependency allowlist).
 
 **Definition of Done:**
 
@@ -241,18 +266,20 @@ later line.
 ## Phase 1 — Storage Engine (the LSM Port)
 
 **Effort:** ~3 weeks
-**Purpose:** the per-node storage engine. This is a *port* of the Python
-`kv-store` engine (WAL → memtable → SSTables → compaction) to Go — the design
-already exists and has 70 tests' worth of lessons baked in; the port hardens it
-and gains real concurrency.
+**Purpose:** the per-node storage engine. This *evolves* the existing Python
+`kv-store` engine (WAL → memtable → SSTables → compaction) — the design
+already exists and has 70 tests' worth of lessons baked in; this pass hardens
+it: block-based SSTables, bloom filters, MVCC key encoding, and safe operation
+under asyncio concurrency (flushes and compaction as background tasks).
 
 **Build:**
 
 - **WAL**: segmented, length-prefixed, CRC-checksummed records; explicit
   `fsync` policy (`sync_every` knob); rotation after flush; idempotent replay.
-- **Memtable**: hand-built **skiplist** (Go has no ordered map; a skiplist gives
-  lock-friendly ordered iteration and is a classic interview structure —
-  building it has purpose).
+- **Memtable**: hand-built **skiplist** (Python's stdlib has no ordered map;
+  a skiplist gives ordered iteration and is a classic interview structure —
+  building it has purpose. `sortedcontainers` is deliberately off the
+  allowlist for exactly this reason).
 - **SSTable**: immutable, block-based format — data blocks, sparse index block,
   bloom filter block, footer. Binary search the sparse index, scan one block.
 - **Compaction**: **size-tiered only**. ADR-004 records why leveled compaction
@@ -266,8 +293,9 @@ and gains real concurrency.
 
 **Tests:**
 
-- Property-based (`rapid`): random op sequences vs a model map — engine and
-  model must agree after every op, across restarts.
+- Property-based (`hypothesis`, including stateful testing): random op
+  sequences vs a model dict — engine and model must agree after every op,
+  across restarts.
 - **Crash-recovery**: kill the process at *every* fsync boundary (injected via
   the `Storage` interface), reopen, verify no acknowledged write is lost and no
   torn write surfaces.
@@ -280,7 +308,7 @@ and gains real concurrency.
 - [ ] Kill-anywhere recovery suite green.
 - [ ] Benchmark table committed (this becomes the "before" for every later perf claim).
 
-**Resume line:** *"Built an LSM-tree storage engine in Go (WAL, skiplist
+**Resume line:** *"Built an LSM-tree storage engine in Python (WAL, skiplist
 memtable, block-based SSTables with bloom filters, size-tiered compaction) with
 crash-recovery tests that kill the process at every fsync boundary."*
 
@@ -301,7 +329,7 @@ above sits on this.
 2. **Log replication** — AppendEntries, consistency check, commit index
    advancement, the Figure 8 commitment rule (never commit a prior term's entry
    by counting replicas — the paper's subtlest trap; there will be a test named
-   `TestFigure8`).
+   `test_figure8`).
 3. **Persistence** — term/vote/log durably on the Phase 1 WAL. Crash-restart is
    a first-class sim event from the start.
 4. **Snapshots** — InstallSnapshot RPC, log truncation, restore on restart.
@@ -315,14 +343,14 @@ above sits on this.
   properties (Election Safety, Leader Append-Only, Log Matching, Leader
   Completeness, State Machine Safety) after every step.
 - **Porcupine enters CI**: a 3-node replicated register; concurrent client
-  histories recorded under chaos; linearizability checked. This check never
-  leaves the repo.
+  histories recorded under chaos, exported as JSON, and checked by the
+  porcupine subprocess shim. This check never leaves the repo.
 
 **Definition of Done:**
 
 - [ ] Five safety properties hold across ≥10,000 seeded chaos runs in nightly CI.
 - [ ] Porcupine verifies linearizability of the replicated KV under partitions.
-- [ ] `TestFigure8` exists and fails if the commitment rule is weakened.
+- [ ] `test_figure8` exists and fails if the commitment rule is weakened.
 - [ ] Metrics: per-node term, commit index, applied index, election count,
       heartbeat round-trip histogram.
 
@@ -479,14 +507,14 @@ psql-compatible, chaos-tested through the full stack."*
 **Effort:** ~2–3 weeks to assemble; permanent thereafter.
 **Purpose:** consolidate the per-phase verification into one weaponized harness,
 and write the document that answers *"how do you know?"* ADR-007 records why
-this is a native Go harness implementing Jepsen's methodology rather than
+this is a native Python harness implementing Jepsen's methodology rather than
 Jepsen itself: the Clojure framework tests black-box systems over real networks
 (minutes per run, non-replayable failures); the sim-native harness runs
 thousands of *deterministic, seed-replayable* schedules per night. Same
 methodology — generators, nemesis, checkers — strictly better ergonomics for a
 system that was architected for it.
 
-**Build — `cmd/torture`:**
+**Build — `consensa/torture`:**
 
 - **Workloads**: `register` (linearizability via porcupine), `bank` (SI
   invariant), `index` (index/row consistency), SQL variants of each.
@@ -636,8 +664,9 @@ Aegis Grafana skillset.
   latency), transaction panel (commits/aborts/restarts, conflict rate, intent
   queue), latency histograms (SQL p50/p99, KV, Raft commit), split/merge event
   annotations.
-- **Structured logging audit**: `slog` everywhere, consistent keys
-  (`range_id`, `txn_id`, `node_id`), log level discipline.
+- **Structured logging audit**: stdlib `logging` with a structured JSON
+  formatter everywhere, consistent keys (`range_id`, `txn_id`, `node_id`),
+  log level discipline.
 - **`docker-compose up` → 3-node cluster + Prometheus + Grafana**, one command.
 - **The scripted demo** (recorded as a GIF for the README):
   1. `psql` in, create tables, run the bank workload.
@@ -797,10 +826,12 @@ that *demonstrably beats* volcano.
 - **Cost-based planning**: cardinality estimation through predicates and joins;
   costed choice of index vs full scan, join order (bounded exhaustive for ≤3
   tables — no cascades framework, ADR-011), and join algorithm.
-- **Vectorized execution**: operators process typed column batches
-  (~1,024 rows) instead of `Next()`-per-row — the DuckDB/modern-OLAP execution
-  model. Scan, filter, projection, hash join vectorized; sort can stay
-  row-based (ADR: measured, not dogma).
+- **Vectorized execution**: operators process typed **NumPy column batches**
+  (~1,024 rows) instead of `next()`-per-row — the DuckDB/modern-OLAP execution
+  model. In Python this is doubly load-bearing: batching amortizes interpreter
+  overhead *and* pushes the inner loops into C, so the vectorized-vs-volcano
+  delta will be dramatic and honest. Scan, filter, projection, hash join
+  vectorized; sort can stay row-based (ADR: measured, not dogma).
 - **`EXPLAIN ANALYZE`**: estimated vs actual rows per operator — the honesty
   tool for the optimizer itself.
 
@@ -938,6 +969,7 @@ of the engineering, not an apology.
 | **Kubernetes operator** | Ops packaging, not systems engineering. `docker-compose` demos everything. |
 | **Admission control / rate limiting** | Real, but already demonstrated in `go-auth-service`; duplicating it here adds nothing new. |
 | **WASM UDFs, GPU anything, io_uring, custom allocators** | Complexity for spectacle — the exact thing this plan exists to prevent. |
+| **Rewriting hot paths in C / Rust / Cython** | The benchmarks measure *deltas* from design decisions, not absolute throughput; chasing raw speed contradicts the correctness-first goal. If a phase becomes unusably slow, that's an ADR, not a rewrite reflex. |
 | **Geo-partitioned rows (row-level homing)** | Phase 17's table-level placement teaches the placement lesson; row-level homing is a large multiplier on it for the same insight. |
 
 ---
@@ -1001,5 +1033,5 @@ Read the starred item *before* starting its phase; the rest during.
 
 ---
 
-*Plan version 1.0 — the constitution is fixed; phase internals may be refined
-via ADRs as the build teaches its lessons.*
+*Plan version 1.1 (Python edition) — the constitution is fixed; phase internals
+may be refined via ADRs as the build teaches its lessons.*
